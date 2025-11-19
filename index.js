@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const WebSocket = require("ws");
 
-const BINANCE_WS = (symbol = "btcusdt", interval = "1m") =>
+const BINANCE_WS = (symbol = "ETHUSD", interval = "1m") =>
   `wss://stream.binance.com:9443/ws/${symbol}@kline_${interval}`;
 
 const app = express();
