@@ -5,6 +5,8 @@ const cors = require("cors");
 const WebSocket = require("ws");
 
 const BINANCE_WS = (symbol = "ETHUSD", interval = "1m") =>
+
+>>>>>>> 1262da09fe2e15eee641a0a46659fbe7595dd760
   `wss://stream.binance.com:9443/ws/${symbol}@kline_${interval}`;
 
 const app = express();
