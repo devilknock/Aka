@@ -6,7 +6,6 @@ const WebSocket = require("ws");
 
 const BINANCE_WS = (symbol = "ethusdt", interval = "1m") =>
 
->>>>>>> 1262da09fe2e15eee641a0a46659fbe7595dd760
   `wss://stream.binance.com:9443/ws/${symbol}@kline_${interval}`;
 
 const app = express();
@@ -129,7 +128,9 @@ function analyzeAndSignal(ohlcArr) {
 }
 
 // --- Connect to Binance kline websocket for a symbol
+
 const SYMBOL = process.env.SYMBOL || "ethusdt";
+
 const INTERVAL = process.env.INTERVAL || "1m";
 let binanceSocket = null;
 
