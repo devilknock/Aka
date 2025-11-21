@@ -6,7 +6,7 @@ const WebSocket = require("ws");
 const axios = require("axios");
 
 // ----------------- CONFIG ------------------
-const SYMBOL = process.env.SYMBOL || "ethusdt";
+const SYMBOL = process.env.SYMBOL || "btcusdt";
 const INTERVAL = process.env.INTERVAL || "1m";
 const HISTORICAL_LIMIT = 300; // old candles count to load initially
 
