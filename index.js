@@ -1,5 +1,5 @@
-// index.js (UPGRADED SIGNAL ENGINE + symbol switching)
-// Node 16+ recommended.
+// index.js (UPGRADED SIGNAL ENGINE)
+// Replace your current file with this. Node 16+ recommended.
 
 const http = require("http");
 const express = require("express");
@@ -8,7 +8,7 @@ const WebSocket = require("ws");
 const axios = require("axios");
 
 // ----------------- CONFIG ------------------
-let CURRENT_SYMBOL = (process.env.SYMBOL || "btcusdt").toLowerCase();
+const SYMBOL = process.env.SYMBOL || "btcusdt";
 const INTERVAL = process.env.INTERVAL || "1m";
 const HISTORICAL_LIMIT = parseInt(process.env.HISTORICAL_LIMIT || "300", 10);
 const PORT = process.env.PORT || 5000;
@@ -19,17 +19,18 @@ const EMA_LONG = parseInt(process.env.EMA_LONG || "21", 10);
 const RSI_PERIOD = parseInt(process.env.RSI_PERIOD || "14", 10);
 
 // Realistic RSI thresholds
-const RSI_BUY_MAX = parseFloat(process.env.RSI_BUY_MAX || "60");
-const RSI_SELL_MIN = parseFloat(process.env.RSI_SELL_MIN || "40");
+const RSI_BUY_MAX = parseFloat(process.env.RSI_BUY_MAX || "60");   // allow RSI up to this on buy
+const RSI_SELL_MIN = parseFloat(process.env.RSI_SELL_MIN || "40"); // allow RSI down to this on sell
 
 // Confirmation settings
-const REQUIRE_CONFIRMATION = true;
+const REQUIRE_CONFIRMATION = true; // require cross to hold for 1 candle after cross to confirm
 
-const BINANCE_WS = (symbol = CURRENT_SYMBOL, interval = INTERVAL) =>
+const BINANCE_WS = (symbol = SYMBOL, interval = INTERVAL) =>
   `wss://stream.binance.com:9443/ws/${symbol}@kline_${interval}`;
 
-const BINANCE_REST = (symbol = CURRENT_SYMBOL, interval = INTERVAL, limit = HISTORICAL_LIMIT) =>
+const BINANCE_REST = (symbol = SYMBOL, interval = INTERVAL, limit = HISTORICAL_LIMIT) =>
   `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${limit}`;
+
 // -------------------------------------------
 
 const app = express();
@@ -39,19 +40,19 @@ app.use(express.json());
 const server = http.createServer(app);
 const wssServer = new WebSocket.Server({ server });
 
-let ohlc = []; // current symbol's candles
+let ohlc = [];
 let lastSignal = null;
-let binanceSocket = null;
-let restarting = false; // avoid concurrent restarts
 
 // =============== UTILITIES ===============
 
+// EMA initialized with SMA for first 'length' points for stability
 function ema(values, length) {
   const out = new Array(values.length).fill(null);
   if (!values.length || values.length < length) return out;
 
   const k = 2 / (length + 1);
 
+  // compute initial SMA at index length-1
   let sum = 0;
   for (let i = 0; i < length; i++) sum += values[i];
   let prevEma = sum / length;
@@ -66,6 +67,7 @@ function ema(values, length) {
   return out;
 }
 
+// Standard RSI (Wilder)
 function rsi(values, period = 14) {
   const out = new Array(values.length).fill(null);
   if (values.length <= period) return out;
@@ -92,6 +94,7 @@ function rsi(values, period = 14) {
   return out;
 }
 
+// simple helper that checks for EMA cross at index i (compares prev index)
 function isCrossUp(emaShort, emaLong, i) {
   if (i <= 0) return false;
   return emaShort[i - 1] <= emaLong[i - 1] && emaShort[i] > emaLong[i];
@@ -101,10 +104,12 @@ function isCrossDown(emaShort, emaLong, i) {
   return emaShort[i - 1] >= emaLong[i - 1] && emaShort[i] < emaLong[i];
 }
 
+// require the cross to be still valid at next candle (confirmation) to reduce noise
 function confirmedCrossUp(emaS, emaL, i) {
   if (!REQUIRE_CONFIRMATION) return isCrossUp(emaS, emaL, i);
+  // cross happened at i and still above at i+1 (if available)
   if (!isCrossUp(emaS, emaL, i)) return false;
-  if (i + 1 >= emaS.length) return true;
+  if (i + 1 >= emaS.length) return true; // can't confirm yet (use as-is)
   return emaS[i + 1] > emaL[i + 1];
 }
 function confirmedCrossDown(emaS, emaL, i) {
@@ -114,10 +119,12 @@ function confirmedCrossDown(emaS, emaL, i) {
   return emaS[i + 1] < emaL[i + 1];
 }
 
+// confidence calculation (simple, scale 0.0 - 0.95)
 function calcConfidence(base = 0.6, rsi, side) {
+  // side: "BUY" expects lower RSI better, "SELL" expects higher RSI better
   let bonus = 0;
   if (side === "BUY") {
-    bonus = Math.max(0, (RSI_BUY_MAX - rsi) / 100);
+    bonus = Math.max(0, (RSI_BUY_MAX - rsi) / 100); // smaller RSI => slightly higher confidence
   } else {
     bonus = Math.max(0, (rsi - RSI_SELL_MIN) / 100);
   }
@@ -126,17 +133,9 @@ function calcConfidence(base = 0.6, rsi, side) {
 }
 
 function broadcast(type, data) {
-  // include symbol if not present
-  if (data && data.symbol === undefined) data.symbol = CURRENT_SYMBOL;
   const payload = JSON.stringify({ type, data });
   wssServer.clients.forEach((c) => {
-    if (c.readyState === WebSocket.OPEN) {
-      try {
-        c.send(payload);
-      } catch (e) {
-        // ignore
-      }
-    }
+    if (c.readyState === WebSocket.OPEN) c.send(payload);
   });
 }
 
@@ -153,15 +152,17 @@ function analyzeAndSignal(ohlcArr) {
   const i = len - 1;
   if (i < EMA_LONG) return { signal: "HOLD", reason: "Not enough data", price: closes[i] ?? null };
 
+  const prev = i - 1;
   const price = closes[i];
   const r = Math.round(rsiArr[i] ?? 50);
 
   const up = confirmedCrossUp(emaS, emaL, i);
   const down = confirmedCrossDown(emaS, emaL, i);
 
+  // BUY condition: crossover up + RSI not overbought (<= RSI_BUY_MAX)
   if (up && r <= RSI_BUY_MAX) {
     const entry = price;
-    const stopLoss = +(price - Math.max(0.2, price * 0.002)).toFixed(2);
+    const stopLoss = +(price - Math.max(0.2, price * 0.002)).toFixed(2); // small ATR-like buffer
     const takeProfit = +(price + Math.max(0.6, price * 0.006)).toFixed(2);
     const confidence = calcConfidence(0.6, r, "BUY");
     return {
@@ -176,6 +177,7 @@ function analyzeAndSignal(ohlcArr) {
     };
   }
 
+  // SELL condition: crossover down + RSI not oversold (>= RSI_SELL_MIN)
   if (down && r >= RSI_SELL_MIN) {
     const entry = price;
     const stopLoss = +(price + Math.max(0.2, price * 0.002)).toFixed(2);
@@ -193,16 +195,16 @@ function analyzeAndSignal(ohlcArr) {
     };
   }
 
+  // No clear condition
   return { signal: "HOLD", reason: `No confirmed cross (RSI ${r})`, price, rsi: r };
 }
 
 // =============== HISTORICAL FETCH ===============
 
-async function loadHistoricalCandles(symbol = CURRENT_SYMBOL) {
+async function loadHistoricalCandles() {
   try {
-    console.log("Fetching historical candles for", symbol);
-    const res = await axios.get(BINANCE_REST(symbol));
-    // transform to consistent shape
+    console.log("Fetching historical candles...");
+    const res = await axios.get(BINANCE_REST());
     ohlc = res.data.map((c) => ({
       t: c[0],
       open: +c[1],
@@ -213,40 +215,35 @@ async function loadHistoricalCandles(symbol = CURRENT_SYMBOL) {
       isFinal: true,
     }));
 
-    console.log(`Loaded ${ohlc.length} historical candles for ${symbol}.`);
+    console.log(`Loaded ${ohlc.length} historical candles.`);
+
     const result = analyzeAndSignal(ohlc);
-    lastSignal = { ...result, symbol, ts: Date.now() };
+    lastSignal = { ...result, symbol: SYMBOL, ts: Date.now() };
+
     broadcast("signal", lastSignal);
     console.log("Initial signal:", lastSignal.signal, "-", lastSignal.reason);
   } catch (err) {
-    console.error("Error loading historical data:", err.message || err);
+    console.error("Error loading historical data:", err.message);
   }
 }
 
 // =============== LIVE STREAM ===============
 
-function startLiveStream(symbol = CURRENT_SYMBOL) {
-  // If a socket exists, close/terminate it first
-  try {
-    if (binanceSocket) {
-      try { binanceSocket.terminate(); } catch (e) {}
-      binanceSocket = null;
-    }
-  } catch (e) {}
+let binanceSocket;
 
-  const url = BINANCE_WS(symbol);
+function startLiveStream() {
+  const url = BINANCE_WS();
   console.log("Connecting WS:", url);
 
   binanceSocket = new WebSocket(url);
 
   binanceSocket.on("open", () => {
-    console.log("Live stream connected for", symbol);
+    console.log("Live stream connected.");
   });
 
   binanceSocket.on("message", (msg) => {
     try {
       const data = JSON.parse(msg);
-      // Binance KLINE payload has 'k'
       if (!data.k) return;
 
       const k = data.k;
@@ -260,26 +257,24 @@ function startLiveStream(symbol = CURRENT_SYMBOL) {
         isFinal: k.x,
       };
 
-      // broadcast price with symbol for frontend clarity
-      broadcast("price", { t: candle.t, close: candle.close, symbol });
+      broadcast("price", { t: candle.t, close: candle.close });
 
       if (candle.isFinal) {
-        // ensure we only keep candles for current symbol
         ohlc.push(candle);
-        if (ohlc.length > 2000) ohlc.shift();
+        if (ohlc.length > 2000) ohlc.shift(); // keep buffer
         const result = analyzeAndSignal(ohlc);
-        lastSignal = { ...result, symbol, ts: Date.now() };
+        lastSignal = { ...result, symbol: SYMBOL, ts: Date.now() };
         broadcast("signal", lastSignal);
         console.log(new Date(), "Signal:", lastSignal.signal, "-", lastSignal.reason);
       }
     } catch (e) {
-      console.error("WS parse error:", e && e.message);
+      console.error("WS parse error:", e);
     }
   });
 
   binanceSocket.on("close", () => {
-    console.log("WS closed for", symbol, " — reconnecting in 3s...");
-    setTimeout(() => startLiveStream(symbol), 3000);
+    console.log("WS closed, reconnecting in 3s...");
+    setTimeout(startLiveStream, 3000);
   });
 
   binanceSocket.on("error", (err) => {
@@ -288,109 +283,19 @@ function startLiveStream(symbol = CURRENT_SYMBOL) {
   });
 }
 
-// =============== HTTP ENDPOINTS ===============
+// =============== HTTP (optional endpoints) ===============
 
 app.get("/signal", (req, res) => {
-  return res.json(lastSignal ?? { signal: "HOLD", reason: "Not ready", symbol: CURRENT_SYMBOL });
+  return res.json(lastSignal ?? { signal: "HOLD", reason: "Not ready" });
 });
 
-app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now(), symbol: CURRENT_SYMBOL }));
-
-// small handy list (you can extend)
-app.get("/available-symbols", (req, res) => {
-  return res.json({
-    symbols: ["btcusdt", "ethusdt", "bnbusdt", "xrpusdt", "adausdt", "solusdt", "dogeusdt"],
-    current: CURRENT_SYMBOL,
-  });
-});
-
-/**
- * POST /change-symbol
- * body: { symbol: "ethusdt" }
- *
- * Behaviour:
- * - validate symbol string
- * - set CURRENT_SYMBOL
- * - reload historical for new symbol
- * - restart live stream for new symbol
- * - broadcast updated lastSignal (after historical loaded)
- */
-app.post("/change-symbol", async (req, res) => {
-  const { symbol } = req.body || {};
-  if (!symbol || typeof symbol !== "string") {
-    return res.status(400).json({ ok: false, error: "symbol required" });
-  }
-  const s = symbol.trim().toLowerCase();
-  // basic validation: letters/numbers only (e.g. btcusdt)
-  if (!/^[a-z0-9]+$/.test(s)) {
-    return res.status(400).json({ ok: false, error: "invalid symbol format" });
-  }
-
-  // Prevent concurrent restarts
-  if (restarting) {
-    return res.status(409).json({ ok: false, error: "restart in progress" });
-  }
-
-  try {
-    restarting = true;
-    console.log("Changing symbol ->", s);
-
-    // set symbol first (affects BINANCE_* helpers)
-    CURRENT_SYMBOL = s;
-
-    // load historical for new symbol
-    await loadHistoricalCandles(s);
-
-    // restart live stream for new symbol
-    startLiveStream(s);
-
-    // broadcast a lightweight notice to clients
-    broadcast("notice", { msg: `Symbol changed to ${s}`, symbol: s });
-
-    restarting = false;
-    return res.json({ ok: true, symbol: s });
-  } catch (err) {
-    restarting = false;
-    console.error("change-symbol error:", err && err.message);
-    return res.status(500).json({ ok: false, error: "failed to change symbol" });
-  }
-});
-
-// optional debugging: push-ohlc (same as your frontend test)
-app.post("/push-ohlc", (req, res) => {
-  const arr = Array.isArray(req.body) ? req.body : null;
-  if (!arr) return res.status(400).json({ ok: false, error: "expected array" });
-
-  // convert incoming items to candle shape with ms timestamps
-  arr.forEach((c) => {
-    const t = Number(c.t) > 1e12 ? Number(c.t) : Number(c.t) * 1000;
-    const candle = {
-      t,
-      open: Number(c.open),
-      high: Number(c.high),
-      low: Number(c.low),
-      close: Number(c.close),
-      volume: Number(c.volume || 0),
-      isFinal: true,
-    };
-    ohlc.push(candle);
-    if (ohlc.length > 2000) ohlc.shift();
-    broadcast("price", { t: candle.t, close: candle.close, symbol: CURRENT_SYMBOL });
-  });
-
-  // re-run signal after pushing
-  const result = analyzeAndSignal(ohlc);
-  lastSignal = { ...result, symbol: CURRENT_SYMBOL, ts: Date.now() };
-  broadcast("signal", lastSignal);
-
-  return res.json({ ok: true, added: arr.length });
-});
+app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // =============== RUN SERVER ===============
 
 server.listen(PORT, async () => {
-  console.log("Server started on", PORT, "initial symbol:", CURRENT_SYMBOL);
+  console.log("Server started on", PORT);
   console.log("Loading historical data...");
-  await loadHistoricalCandles(CURRENT_SYMBOL);
-  startLiveStream(CURRENT_SYMBOL);
+  await loadHistoricalCandles();
+  startLiveStream();
 });
