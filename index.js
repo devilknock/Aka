@@ -1,301 +1,163 @@
-// index.js (UPGRADED SIGNAL ENGINE)
-// Replace your current file with this. Node 16+ recommended.
-
-const http = require("http");
+// ---------------- CONFIG ----------------
 const express = require("express");
+const http = require("http");
 const cors = require("cors");
 const WebSocket = require("ws");
 const axios = require("axios");
 
-// ----------------- CONFIG ------------------
-const SYMBOL = process.env.SYMBOL || "btcusdt";
-const INTERVAL = process.env.INTERVAL || "1m";
-const HISTORICAL_LIMIT = parseInt(process.env.HISTORICAL_LIMIT || "300", 10);
-const PORT = process.env.PORT || 5000;
+const SYMBOL = "btcusdt";
+const INTERVAL = "1m";             // 1-minute live candles
+const HIST_LIMIT = 200;            // Load last 200 candles
 
-// Signal tuning parameters (change as needed)
-const EMA_SHORT = parseInt(process.env.EMA_SHORT || "9", 10);
-const EMA_LONG = parseInt(process.env.EMA_LONG || "21", 10);
-const RSI_PERIOD = parseInt(process.env.RSI_PERIOD || "14", 10);
-
-// Realistic RSI thresholds
-const RSI_BUY_MAX = parseFloat(process.env.RSI_BUY_MAX || "60");   // allow RSI up to this on buy
-const RSI_SELL_MIN = parseFloat(process.env.RSI_SELL_MIN || "40"); // allow RSI down to this on sell
-
-// Confirmation settings
-const REQUIRE_CONFIRMATION = true; // require cross to hold for 1 candle after cross to confirm
-
-const BINANCE_WS = (symbol = SYMBOL, interval = INTERVAL) =>
-  `wss://stream.binance.com:9443/ws/${symbol}@kline_${interval}`;
-
-const BINANCE_REST = (symbol = SYMBOL, interval = INTERVAL, limit = HISTORICAL_LIMIT) =>
-  `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${limit}`;
-
-// -------------------------------------------
-
+// ------------- APP SETUP ---------------
 const app = express();
 app.use(cors());
-app.use(express.json());
-
 const server = http.createServer(app);
-const wssServer = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ server });
 
-let ohlc = [];
-let lastSignal = null;
+// ------------ GLOBAL DATA -------------
+let candles = [];        // full OHLC list
+let lastSignal = null;   // last Buy/Sell/Hold
+let wsBinance = null;
 
-// =============== UTILITIES ===============
-
-// EMA initialized with SMA for first 'length' points for stability
-function ema(values, length) {
-  const out = new Array(values.length).fill(null);
-  if (!values.length || values.length < length) return out;
-
-  const k = 2 / (length + 1);
-
-  // compute initial SMA at index length-1
-  let sum = 0;
-  for (let i = 0; i < length; i++) sum += values[i];
-  let prevEma = sum / length;
-  out[length - 1] = prevEma;
-
-  for (let i = length; i < values.length; i++) {
-    const v = values[i];
-    const emaVal = v * k + prevEma * (1 - k);
-    out[i] = emaVal;
-    prevEma = emaVal;
+// ------------ EMA FUNCTION -------------
+function calcEMA(prices, period) {
+  const k = 2 / (period + 1);
+  let ema = prices[0];
+  for (let i = 1; i < prices.length; i++) {
+    ema = prices[i] * k + ema * (1 - k);
   }
-  return out;
+  return ema;
 }
 
-// Standard RSI (Wilder)
-function rsi(values, period = 14) {
-  const out = new Array(values.length).fill(null);
-  if (values.length <= period) return out;
+// ------------ RSI FUNCTION -------------
+function calcRSI(closes, length = 14) {
+  if (closes.length < length + 1) return null;
 
-  let gains = 0;
-  let losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const change = values[i] - values[i - 1];
-    if (change >= 0) gains += change;
-    else losses += -change;
-  }
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-  out[period] = 100 - 100 / (1 + avgGain / (avgLoss || 1e-8));
+  let gains = 0, losses = 0;
 
-  for (let i = period + 1; i < values.length; i++) {
-    const change = values[i] - values[i - 1];
-    const gain = change > 0 ? change : 0;
-    const loss = change < 0 ? -change : 0;
-    avgGain = (avgGain * (period - 1) + gain) / period;
-    avgLoss = (avgLoss * (period - 1) + loss) / period;
-    out[i] = 100 - 100 / (1 + avgGain / (avgLoss || 1e-8));
-  }
-  return out;
-}
-
-// simple helper that checks for EMA cross at index i (compares prev index)
-function isCrossUp(emaShort, emaLong, i) {
-  if (i <= 0) return false;
-  return emaShort[i - 1] <= emaLong[i - 1] && emaShort[i] > emaLong[i];
-}
-function isCrossDown(emaShort, emaLong, i) {
-  if (i <= 0) return false;
-  return emaShort[i - 1] >= emaLong[i - 1] && emaShort[i] < emaLong[i];
-}
-
-// require the cross to be still valid at next candle (confirmation) to reduce noise
-function confirmedCrossUp(emaS, emaL, i) {
-  if (!REQUIRE_CONFIRMATION) return isCrossUp(emaS, emaL, i);
-  // cross happened at i and still above at i+1 (if available)
-  if (!isCrossUp(emaS, emaL, i)) return false;
-  if (i + 1 >= emaS.length) return true; // can't confirm yet (use as-is)
-  return emaS[i + 1] > emaL[i + 1];
-}
-function confirmedCrossDown(emaS, emaL, i) {
-  if (!REQUIRE_CONFIRMATION) return isCrossDown(emaS, emaL, i);
-  if (!isCrossDown(emaS, emaL, i)) return false;
-  if (i + 1 >= emaS.length) return true;
-  return emaS[i + 1] < emaL[i + 1];
-}
-
-// confidence calculation (simple, scale 0.0 - 0.95)
-function calcConfidence(base = 0.6, rsi, side) {
-  // side: "BUY" expects lower RSI better, "SELL" expects higher RSI better
-  let bonus = 0;
-  if (side === "BUY") {
-    bonus = Math.max(0, (RSI_BUY_MAX - rsi) / 100); // smaller RSI => slightly higher confidence
-  } else {
-    bonus = Math.max(0, (rsi - RSI_SELL_MIN) / 100);
-  }
-  const conf = Math.min(0.95, base + bonus);
-  return +conf.toFixed(2);
-}
-
-function broadcast(type, data) {
-  const payload = JSON.stringify({ type, data });
-  wssServer.clients.forEach((c) => {
-    if (c.readyState === WebSocket.OPEN) c.send(payload);
-  });
-}
-
-// =============== SIGNAL ENGINE ===============
-
-function analyzeAndSignal(ohlcArr) {
-  const closes = ohlcArr.map((d) => d.close);
-  const len = closes.length;
-
-  const emaS = ema(closes, EMA_SHORT);
-  const emaL = ema(closes, EMA_LONG);
-  const rsiArr = rsi(closes, RSI_PERIOD);
-
-  const i = len - 1;
-  if (i < EMA_LONG) return { signal: "HOLD", reason: "Not enough data", price: closes[i] ?? null };
-
-  const prev = i - 1;
-  const price = closes[i];
-  const r = Math.round(rsiArr[i] ?? 50);
-
-  const up = confirmedCrossUp(emaS, emaL, i);
-  const down = confirmedCrossDown(emaS, emaL, i);
-
-  // BUY condition: crossover up + RSI not overbought (<= RSI_BUY_MAX)
-  if (up && r <= RSI_BUY_MAX) {
-    const entry = price;
-    const stopLoss = +(price - Math.max(0.2, price * 0.002)).toFixed(2); // small ATR-like buffer
-    const takeProfit = +(price + Math.max(0.6, price * 0.006)).toFixed(2);
-    const confidence = calcConfidence(0.6, r, "BUY");
-    return {
-      signal: "BUY",
-      entry,
-      stopLoss,
-      takeProfit,
-      confidence,
-      reason: `EMA cross up (S:${EMA_SHORT} over L:${EMA_LONG}) + RSI ${r} <= ${RSI_BUY_MAX}`,
-      price,
-      rsi: r,
-    };
+  for (let i = closes.length - length - 1; i < closes.length - 1; i++) {
+    const diff = closes[i + 1] - closes[i];
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
   }
 
-  // SELL condition: crossover down + RSI not oversold (>= RSI_SELL_MIN)
-  if (down && r >= RSI_SELL_MIN) {
-    const entry = price;
-    const stopLoss = +(price + Math.max(0.2, price * 0.002)).toFixed(2);
-    const takeProfit = +(price - Math.max(0.6, price * 0.006)).toFixed(2);
-    const confidence = calcConfidence(0.6, r, "SELL");
-    return {
-      signal: "SELL",
-      entry,
-      stopLoss,
-      takeProfit,
-      confidence,
-      reason: `EMA cross down (S:${EMA_SHORT} below L:${EMA_LONG}) + RSI ${r} >= ${RSI_SELL_MIN}`,
-      price,
-      rsi: r,
-    };
-  }
+  const avgGain = gains / length;
+  const avgLoss = losses / length;
 
-  // No clear condition
-  return { signal: "HOLD", reason: `No confirmed cross (RSI ${r})`, price, rsi: r };
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+
+  return 100 - 100 / (1 + rs);
 }
 
-// =============== HISTORICAL FETCH ===============
+// ------------ SIGNAL LOGIC -------------
+function getSignal() {
+  const closes = candles.map(c => parseFloat(c.close));
+  if (closes.length < 20) return "HOLD";
 
-async function loadHistoricalCandles() {
-  try {
-    console.log("Fetching historical candles...");
-    const res = await axios.get(BINANCE_REST());
-    ohlc = res.data.map((c) => ({
-      t: c[0],
-      open: +c[1],
-      high: +c[2],
-      low: +c[3],
-      close: +c[4],
-      volume: +c[5],
-      isFinal: true,
-    }));
+  const ema5 = calcEMA(closes, 5);
+  const ema20 = calcEMA(closes, 20);
+  const rsi = calcRSI(closes);
 
-    console.log(`Loaded ${ohlc.length} historical candles.`);
+  const lastClose = closes[closes.length - 1];
 
-    const result = analyzeAndSignal(ohlc);
-    lastSignal = { ...result, symbol: SYMBOL, ts: Date.now() };
+  let signal = "HOLD";
 
-    broadcast("signal", lastSignal);
-    console.log("Initial signal:", lastSignal.signal, "-", lastSignal.reason);
-  } catch (err) {
-    console.error("Error loading historical data:", err.message);
+  // BUY Logic — TradingView style
+  if (ema5 > ema20 && rsi > 55 && rsi < 70 && lastClose > ema20) {
+    signal = "BUY";
   }
+
+  // SELL Logic
+  else if (ema5 < ema20 && rsi < 45 && rsi > 30 && lastClose < ema20) {
+    signal = "SELL";
+  }
+
+  const result = {
+    symbol: SYMBOL,
+    signal,
+    rsi: Math.round(rsi),
+    ema5: ema5.toFixed(2),
+    ema20: ema20.toFixed(2),
+    time: new Date().toLocaleString(),
+  };
+
+  lastSignal = result;
+
+  console.log("SIGNAL:", result);
+  sendToFrontend({ type: "signal", data: result });
 }
 
-// =============== LIVE STREAM ===============
-
-let binanceSocket;
-
-function startLiveStream() {
-  const url = BINANCE_WS();
-  console.log("Connecting WS:", url);
-
-  binanceSocket = new WebSocket(url);
-
-  binanceSocket.on("open", () => {
-    console.log("Live stream connected.");
-  });
-
-  binanceSocket.on("message", (msg) => {
-    try {
-      const data = JSON.parse(msg);
-      if (!data.k) return;
-
-      const k = data.k;
-      const candle = {
-        t: k.t,
-        open: +k.o,
-        high: +k.h,
-        low: +k.l,
-        close: +k.c,
-        volume: +k.v,
-        isFinal: k.x,
-      };
-
-      broadcast("price", { t: candle.t, close: candle.close });
-
-      if (candle.isFinal) {
-        ohlc.push(candle);
-        if (ohlc.length > 2000) ohlc.shift(); // keep buffer
-        const result = analyzeAndSignal(ohlc);
-        lastSignal = { ...result, symbol: SYMBOL, ts: Date.now() };
-        broadcast("signal", lastSignal);
-        console.log(new Date(), "Signal:", lastSignal.signal, "-", lastSignal.reason);
-      }
-    } catch (e) {
-      console.error("WS parse error:", e);
+// ----------- BROADCAST FUNCTION --------
+function sendToFrontend(msg) {
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(msg));
     }
   });
-
-  binanceSocket.on("close", () => {
-    console.log("WS closed, reconnecting in 3s...");
-    setTimeout(startLiveStream, 3000);
-  });
-
-  binanceSocket.on("error", (err) => {
-    console.error("WS error:", err && err.message);
-    try { binanceSocket.terminate(); } catch (e) {}
-  });
 }
 
-// =============== HTTP (optional endpoints) ===============
+// --------- INITIAL HISTORICAL DATA -----
+async function loadInitialCandles() {
+  const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL.toUpperCase()}&interval=${INTERVAL}&limit=${HIST_LIMIT}`;
+  const res = await axios.get(url);
 
-app.get("/signal", (req, res) => {
-  return res.json(lastSignal ?? { signal: "HOLD", reason: "Not ready" });
+  candles = res.data.map(c => ({
+    open: c[1],
+    close: c[4],
+    time: c[0]
+  }));
+}
+
+// ------------- LIVE WEBSOCKET ----------
+function connectBinance() {
+  const url = `wss://stream.binance.com:9443/ws/${SYMBOL}@kline_${INTERVAL}`;
+  wsBinance = new WebSocket(url);
+
+  wsBinance.onopen = () => console.log("Binance WS connected");
+  wsBinance.onclose = () => {
+    console.log("Binance WS closed — reconnecting...");
+    setTimeout(connectBinance, 3000);
+  };
+  wsBinance.onerror = () => wsBinance.close();
+
+  wsBinance.onmessage = msg => {
+    const data = JSON.parse(msg.data);
+    if (!data.k) return;
+
+    const k = data.k; // candle data
+
+    const candle = {
+      open: k.o,
+      close: k.c,
+      time: k.t,
+    };
+
+    if (k.x === false) {
+      // Candle running (update last)
+      candles[candles.length - 1] = candle;
+    } else {
+      // Candle closed → push new
+      candles.push(candle);
+      if (candles.length > HIST_LIMIT) candles.shift();
+
+      // NEW SIGNAL — every 1 minute
+      getSignal();
+    }
+
+    sendToFrontend({ type: "price", data: candle });
+  };
+}
+
+// ---------------- ROUTES ---------------
+app.get("/", (req, res) => {
+  res.send("Backend running 🚀");
 });
 
-app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
-
-// =============== RUN SERVER ===============
-
-server.listen(PORT, async () => {
-  console.log("Server started on", PORT);
-  console.log("Loading historical data...");
-  await loadHistoricalCandles();
-  startLiveStream();
+// ------------- START SERVER ------------
+server.listen(4000, async () => {
+  console.log("Server running on port 4000");
+  await loadInitialCandles();
+  connectBinance();
 });
