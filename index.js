@@ -8,7 +8,7 @@ const WebSocket = require("ws");
 const axios = require("axios");
 
 // ----------------- CONFIG ------------------
-const SYMBOL = process.env.SYMBOL || "btcusdt";
+const SYMBOL = process.env.SYMBOL || "ethusdt";
 const INTERVAL = process.env.INTERVAL || "1m";
 const HISTORICAL_LIMIT = parseInt(process.env.HISTORICAL_LIMIT || "300", 10);
 const PORT = process.env.PORT || 5000;
