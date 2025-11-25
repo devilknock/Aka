@@ -177,3 +177,136 @@ server.listen(4000, async () => {
   await loadInitialCandles();
   connectBinance();
 });
+
+// ================= SIGNAL ENGINE WITH PATTERN + SL/TP + PRICE RANGE =================
+
+function detectChartPatterns(candles) {
+  if (!candles || candles.length < 20) return null;
+
+  const last = candles[candles.length - 1];
+  const prev = candles[candles.length - 2];
+
+  // ----- Bullish Engulfing -----
+  if (prev.close < prev.open && last.close > last.open && last.close > prev.open)
+    return { pattern: "Bullish Engulfing", type: "bullish" };
+
+  // ----- Bearish Engulfing -----
+  if (prev.close > prev.open && last.close < last.open && last.close < prev.open)
+    return { pattern: "Bearish Engulfing", type: "bearish" };
+
+  // ----- Double Bottom -----
+  const lows = candles.slice(-6).map(c => c.low);
+  const min1 = lows[0];
+  const min2 = lows[3];
+  if (Math.abs(min1 - min2) < min1 * 0.003)
+    return { pattern: "Double Bottom", type: "bullish" };
+
+  // ----- Double Top -----
+  const highs = candles.slice(-6).map(c => c.high);
+  const max1 = highs[0];
+  const max2 = highs[3];
+  if (Math.abs(max1 - max2) < max1 * 0.003)
+    return { pattern: "Double Top", type: "bearish" };
+
+  return null;
+}
+
+
+// ================= PRICE RANGE + SL/TP CALCULATOR =================
+
+function calculateLevels(price, direction) {
+  const range = {
+    buy: {
+      priceRange: [price * 0.995, price * 1.005],
+      stopLoss: price * 0.985,
+      takeProfit: price * 1.02
+    },
+    sell: {
+      priceRange: [price * 1.005, price * 0.995],
+      stopLoss: price * 1.015,
+      takeProfit: price * 0.98
+    }
+  };
+
+  return range[direction];
+}
+
+// ================= SIGNAL ENGINE WITH PATTERN + SL/TP + PRICE RANGE =================
+
+function detectChartPatterns(candles) {
+  if (!candles || candles.length < 20) return null;
+
+  const last = candles[candles.length - 1];
+  const prev = candles[candles.length - 2];
+
+  // ----- Bullish Engulfing -----
+  if (prev.close < prev.open && last.close > last.open && last.close > prev.open)
+    return { pattern: "Bullish Engulfing", type: "bullish" };
+
+  // ----- Bearish Engulfing -----
+  if (prev.close > prev.open && last.close < last.open && last.close < prev.open)
+    return { pattern: "Bearish Engulfing", type: "bearish" };
+
+  // ----- Double Bottom -----
+  const lows = candles.slice(-6).map(c => c.low);
+  const min1 = lows[0];
+  const min2 = lows[3];
+  if (Math.abs(min1 - min2) < min1 * 0.003)
+    return { pattern: "Double Bottom", type: "bullish" };
+
+  // ----- Double Top -----
+  const highs = candles.slice(-6).map(c => c.high);
+  const max1 = highs[0];
+  const max2 = highs[3];
+  if (Math.abs(max1 - max2) < max1 * 0.003)
+    return { pattern: "Double Top", type: "bearish" };
+
+  return null;
+}
+
+
+// ================= PRICE RANGE + SL/TP CALCULATOR =================
+
+function calculateLevels(price, direction) {
+  const range = {
+    buy: {
+      priceRange: [price * 0.995, price * 1.005],
+      stopLoss: price * 0.985,
+      takeProfit: price * 1.02
+    },
+    sell: {
+      priceRange: [price * 1.005, price * 0.995],
+      stopLoss: price * 1.015,
+      takeProfit: price * 0.98
+    }
+  };
+
+  return range[direction];
+}
+
+
+// ================= MAIN SIGNAL GENERATOR =================
+
+function generateSignal(candles) {
+  if (!candles || candles.length < 20) return null;
+
+  const pattern = detectChartPatterns(candles);
+  if (!pattern) return null;
+
+  const lastPrice = candles[candles.length - 1].close;
+  const direction = pattern.type === "bullish" ? "buy" : "sell";
+
+  const levels = calculateLevels(lastPrice, direction);
+
+  return {
+    pattern: pattern.pattern,
+    direction,
+    currentPrice: lastPrice,
+    priceRange: levels.priceRange,
+    stopLoss: levels.stopLoss,
+    takeProfit: levels.takeProfit,
+    time: Date.now()
+  };
+}
+
+module.exports = { generateSignal };
