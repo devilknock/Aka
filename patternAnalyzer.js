@@ -1,11 +1,34 @@
-// ================= CHART PATTERN ANALYZER =================
+// ================= CHART PATTERN ANALYZER (WITH SL/TP) =================
+
+function findSwingHigh(candles) {
+  const highs = candles.map(c => parseFloat(c.high));
+  const len = highs.length;
+
+  for (let i = len - 3; i >= 2; i--) {
+    if (highs[i] > highs[i - 1] && highs[i] > highs[i + 1]) {
+      return highs[i];
+    }
+  }
+  return highs[len - 1];
+}
+
+function findSwingLow(candles) {
+  const lows = candles.map(c => parseFloat(c.low));
+  const len = lows.length;
+
+  for (let i = len - 3; i >= 2; i--) {
+    if (lows[i] < lows[i - 1] && lows[i] < lows[i + 1]) {
+      return lows[i];
+    }
+  }
+  return lows[len - 1];
+}
 
 function detectChartPatterns(candles) {
-  if (candles.length < 50) return null;
+  if (!candles || candles.length < 50) return null;
 
   const closes = candles.map(c => parseFloat(c.close));
   const len = closes.length;
-
   let pattern = null;
 
   // ------ PRICE POINTS ------
@@ -70,17 +93,17 @@ function detectChartPatterns(candles) {
     pattern = "DESCENDING_TRIANGLE";
   }
 
-  // ========== BULLISH FLAG ==========
+  // ========== BULL FLAG ==========
   const last30 = closes.slice(-30);
-  const rise = last30[10] < last30[0] * 0.98;  
+  const rise = last30[10] < last30[0] * 0.98;
   const flat = Math.abs(last30[29] - last30[10]) < last30[0] * 0.015;
 
   if (rise && flat) {
     pattern = "BULL_FLAG";
   }
 
-  // ========== BEARISH FLAG ==========
-  const drop = last30[10] > last30[0] * 1.02;  
+  // ========== BEAR FLAG ==========
+  const drop = last30[10] > last30[0] * 1.02;
   const flat2 = Math.abs(last30[29] - last30[10]) < last30[0] * 0.015;
 
   if (drop && flat2) {
@@ -100,7 +123,40 @@ function detectChartPatterns(candles) {
     pattern = "CUP_HANDLE";
   }
 
-  return pattern;
+  if (!pattern) return null;
+
+  // ================= SWING BASED SL/TP =================
+  const entry = closes[len - 1];
+  const swingHigh = findSwingHigh(candles);
+  const swingLow = findSwingLow(candles);
+
+  let side = null;
+  let sl = null;
+  let tp = null;
+
+  if (
+    pattern === "DOUBLE_BOTTOM" ||
+    pattern === "INVERSE_HEAD_SHOULDERS" ||
+    pattern === "FALLING_WEDGE" ||
+    pattern === "BULL_FLAG" ||
+    pattern === "ASCENDING_TRIANGLE"
+  ) {
+    side = "BUY";
+    sl = swingLow;
+    tp = swingHigh;
+  } else {
+    side = "SELL";
+    sl = swingHigh;
+    tp = swingLow;
+  }
+
+  return {
+    pattern,
+    side,
+    entry,
+    stopLoss: sl,
+    takeProfit: tp
+  };
 }
 
 module.exports = detectChartPatterns;
