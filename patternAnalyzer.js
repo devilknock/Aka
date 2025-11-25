@@ -72,7 +72,7 @@ function detectChartPatterns(candles) {
 
   // ========== BULLISH FLAG ==========
   const last30 = closes.slice(-30);
-  const rise = last30[10] < last30[0] * 0.98;  
+  const rise = last30[10] < last30[0] * 0.98;
   const flat = Math.abs(last30[29] - last30[10]) < last30[0] * 0.015;
 
   if (rise && flat) {
@@ -80,7 +80,7 @@ function detectChartPatterns(candles) {
   }
 
   // ========== BEARISH FLAG ==========
-  const drop = last30[10] > last30[0] * 1.02;  
+  const drop = last30[10] > last30[0] * 1.02;
   const flat2 = Math.abs(last30[29] - last30[10]) < last30[0] * 0.015;
 
   if (drop && flat2) {
@@ -100,7 +100,38 @@ function detectChartPatterns(candles) {
     pattern = "CUP_HANDLE";
   }
 
-  return pattern;
+  // ============================================
+  //     PRICE RANGE DETECTOR + TP + SL LOGIC
+  // ============================================
+  const price = closes[len - 1];
+  let entry = price;
+  let stopLoss = null;
+  let takeProfit = null;
+
+  if (pattern === "DOUBLE_BOTTOM" || pattern === "INVERSE_HEAD_SHOULDERS" || pattern === "FALLING_WEDGE" || pattern === "ASCENDING_TRIANGLE" || pattern === "BULL_FLAG" || pattern === "CUP_HANDLE") {
+    stopLoss = price * 0.985;   // 1.5% SL
+    takeProfit = price * 1.02;  // 2% TP
+  }
+
+  if (pattern === "DOUBLE_TOP" || pattern === "HEAD_SHOULDERS" || pattern === "RISING_WEDGE" || pattern === "DESCENDING_TRIANGLE" || pattern === "BEAR_FLAG") {
+    stopLoss = price * 1.015;   // 1.5% SL
+    takeProfit = price * 0.98;  // 2% TP
+  }
+
+  // Profit Range % calculation
+  let profitRange = null;
+  if (takeProfit) {
+    profitRange = ((takeProfit - entry) / entry * 100).toFixed(2);
+  }
+
+  // Final output
+  return {
+    pattern,
+    entry,
+    stopLoss,
+    takeProfit,
+    profitRange
+  };
 }
 
 module.exports = detectChartPatterns;
