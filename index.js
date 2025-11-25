@@ -5,6 +5,8 @@ const cors = require("cors");
 const WebSocket = require("ws");
 const axios = require("axios");
 
+const detectChartPatterns = require("./patternAnalyzer");
+
 const SYMBOL = "btcusdt";
 const INTERVAL = "1m";             // 1-minute live candles
 const HIST_LIMIT = 200;            // Load last 200 candles
@@ -87,6 +89,20 @@ function getSignal() {
 
   console.log("SIGNAL:", result);
   sendToFrontend({ type: "signal", data: result });
+ 
+  // ------ CHART PATTERN DETECTION ------
+const detectedPattern = detectChartPatterns(candles);
+if (detectedPattern) {
+  console.log("PATTERN:", detectedPattern);
+  sendToFrontend({
+    type: "pattern",
+    data: {
+      symbol: SYMBOL,
+      pattern: detectedPattern,
+      time: new Date().toLocaleString(),
+    }
+  });
+ }
 }
 
 // ----------- BROADCAST FUNCTION --------
