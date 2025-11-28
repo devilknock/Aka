@@ -1,312 +1,220 @@
-// ---------------- CONFIG ----------------
+// ===================================================
+// FILE: server.js
+// DESCRIPTION: Main Backend Server (Node.js/Express)
+// ===================================================
+
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const WebSocket = require("ws");
 const axios = require("axios");
 
+// Import the Pattern Analyzer we created
 const detectChartPatterns = require("./patternAnalyzer");
 
+// --- CONFIGURATION ---
 const SYMBOL = "btcusdt";
-const INTERVAL = "1m";             // 1-minute live candles
-const HIST_LIMIT = 200;            // Load last 200 candles
+const INTERVAL = "1m";
+const HIST_LIMIT = 200; // Keep last 200 candles in memory
+const PORT = 4000;
 
-// ------------- APP SETUP ---------------
+// --- APP SETUP ---
 const app = express();
 app.use(cors());
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// ------------ GLOBAL DATA -------------
-let candles = [];        // full OHLC list
-let lastSignal = null;   // last Buy/Sell/Hold
-let wsBinance = null;
+// --- GLOBAL STATE ---
+let candles = []; 
 
-// ------------ EMA FUNCTION -------------
+// ===================================================
+// UTILITY FUNCTIONS (INDICATORS)
+// ===================================================
+
+// 1. Calculate EMA (Exponential Moving Average)
 function calcEMA(prices, period) {
+  if (prices.length < period) return null;
+  
   const k = 2 / (period + 1);
-  let ema = prices[0];
-  for (let i = 1; i < prices.length; i++) {
-    ema = prices[i] * k + ema * (1 - k);
+  
+  // Step 1: SMA for the first period
+  let sum = 0;
+  for(let i=0; i<period; i++) sum += prices[i];
+  let ema = sum / period;
+
+  // Step 2: EMA for the rest
+  for (let i = period; i < prices.length; i++) {
+    ema = (prices[i] * k) + (ema * (1 - k));
   }
   return ema;
 }
 
-// ------------ RSI FUNCTION -------------
-function calcRSI(closes, length = 14) {
-  if (closes.length < length + 1) return null;
+// 2. Calculate RSI (Wilder's Smoothing Method - Standard)
+function calcRSI(prices, period = 14) {
+  if (prices.length < period + 1) return null;
 
   let gains = 0, losses = 0;
 
-  for (let i = closes.length - length - 1; i < closes.length - 1; i++) {
-    const diff = closes[i + 1] - closes[i];
+  // Initial SMA of gains/losses
+  for (let i = 1; i <= period; i++) {
+    const diff = prices[i] - prices[i - 1];
     if (diff >= 0) gains += diff;
-    else losses -= diff;
+    else losses -= Math.abs(diff);
   }
 
-  const avgGain = gains / length;
-  const avgLoss = losses / length;
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+
+  // Smoothed averages
+  for (let i = period + 1; i < prices.length; i++) {
+    const diff = prices[i] - prices[i - 1];
+    const currentGain = diff > 0 ? diff : 0;
+    const currentLoss = diff < 0 ? Math.abs(diff) : 0;
+
+    avgGain = ((avgGain * (period - 1)) + currentGain) / period;
+    avgLoss = ((avgLoss * (period - 1)) + currentLoss) / period;
+  }
 
   if (avgLoss === 0) return 100;
   const rs = avgGain / avgLoss;
-
-  return 100 - 100 / (1 + rs);
+  return 100 - (100 / (1 + rs));
 }
 
-// ------------ SIGNAL LOGIC -------------
-function getSignal() {
-  const closes = candles.map(c => parseFloat(c.close));
-  if (closes.length < 20) return "HOLD";
+// ===================================================
+// CORE LOGIC: SIGNAL GENERATOR
+// ===================================================
 
-  const ema5 = calcEMA(closes, 5);
-  const ema20 = calcEMA(closes, 20);
-  const rsi = calcRSI(closes);
+function analyzeMarket() {
+  if (candles.length < 50) return; 
 
+  const closes = candles.map(c => c.close);
   const lastClose = closes[closes.length - 1];
 
+  // --- Calculate Indicators ---
+  const ema5 = calcEMA(closes, 5);
+  const ema20 = calcEMA(closes, 20);
+  const rsi = calcRSI(closes, 14);
+
+  // Safety check
+  if (!ema5 || !ema20 || !rsi) return;
+
+  // --- 1. Buy/Sell Signal Logic ---
   let signal = "HOLD";
 
-  // BUY Logic — TradingView style
-  if (ema5 > ema20 && rsi > 55 && rsi < 70 && lastClose > ema20) {
+  // BUY Condition: EMA Crossover + RSI Healthy + Price above EMA20
+  if (ema5 > ema20 && rsi > 50 && rsi < 70 && lastClose > ema20) {
     signal = "BUY";
   }
-
-  // SELL Logic
-  else if (ema5 < ema20 && rsi < 45 && rsi > 30 && lastClose < ema20) {
+  // SELL Condition: EMA Crossunder + RSI Weak + Price below EMA20
+  else if (ema5 < ema20 && rsi < 50 && rsi > 30 && lastClose < ema20) {
     signal = "SELL";
   }
 
+  // --- 2. Chart Pattern Detection ---
+  const detectedPattern = detectChartPatterns(candles);
+
+  // --- Prepare Payload ---
   const result = {
-    symbol: SYMBOL,
-    signal,
-    rsi: Math.round(rsi),
-    ema5: ema5.toFixed(2),
-    ema20: ema20.toFixed(2),
-    time: new Date().toLocaleString(),
+    symbol: SYMBOL.toUpperCase(),
+    price: lastClose,
+    signal: signal,
+    pattern: detectedPattern || "NONE",
+    indicators: {
+      rsi: rsi.toFixed(2),
+      ema5: ema5.toFixed(2),
+      ema20: ema20.toFixed(2)
+    },
+    timestamp: new Date().toLocaleTimeString()
   };
 
-  lastSignal = result;
-
-  console.log("SIGNAL:", result);
-  sendToFrontend({ type: "signal", data: result });
- 
-  // ------ CHART PATTERN DETECTION ------
-const detectedPattern = detectChartPatterns(candles);
-if (detectedPattern) {
-  console.log("PATTERN:", detectedPattern);
-  sendToFrontend({
-    type: "pattern",
-    data: {
-      symbol: SYMBOL,
-      pattern: detectedPattern,
-      time: new Date().toLocaleString(),
-    }
-  });
- }
+  console.log(`[${result.timestamp}] Signal: ${signal} | Pattern: ${result.pattern} | RSI: ${result.indicators.rsi}`);
+  
+  // Broadcast to Frontend
+  sendToFrontend(result);
 }
 
-// ----------- BROADCAST FUNCTION --------
-function sendToFrontend(msg) {
+function sendToFrontend(data) {
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(msg));
+      client.send(JSON.stringify(data));
     }
   });
 }
 
-// --------- INITIAL HISTORICAL DATA -----
-async function loadInitialCandles() {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL.toUpperCase()}&interval=${INTERVAL}&limit=${HIST_LIMIT}`;
-  const res = await axios.get(url);
+// ===================================================
+// DATA STREAMING (BINANCE)
+// ===================================================
 
-  candles = res.data.map(c => ({
-    open: c[1],
-    close: c[4],
-    time: c[0]
-  }));
+async function loadHistoricalData() {
+  try {
+    console.log("Fetching historical data...");
+    const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL.toUpperCase()}&interval=${INTERVAL}&limit=${HIST_LIMIT}`;
+    const res = await axios.get(url);
+    
+    // Format Binance Data
+    candles = res.data.map(c => ({
+      open: parseFloat(c[1]),
+      high: parseFloat(c[2]),
+      low: parseFloat(c[3]),
+      close: parseFloat(c[4]),
+      time: c[0]
+    }));
+    
+    console.log(`Loaded ${candles.length} candles.`);
+  } catch (error) {
+    console.error("Error loading history:", error.message);
+  }
 }
 
-// ------------- LIVE WEBSOCKET ----------
-function connectBinance() {
-  const url = `wss://stream.binance.com:9443/ws/${SYMBOL}@kline_${INTERVAL}`;
-  wsBinance = new WebSocket(url);
+function connectBinanceWebSocket() {
+  const wsUrl = `wss://stream.binance.com:9443/ws/${SYMBOL}@kline_${INTERVAL}`;
+  const ws = new WebSocket(wsUrl);
 
-  wsBinance.onopen = () => console.log("Binance WS connected");
-  wsBinance.onclose = () => {
-    console.log("Binance WS closed — reconnecting...");
-    setTimeout(connectBinance, 3000);
-  };
-  wsBinance.onerror = () => wsBinance.close();
+  ws.onopen = () => console.log("Connected to Binance WebSocket");
+  
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (!msg.k) return;
 
-  wsBinance.onmessage = msg => {
-    const data = JSON.parse(msg.data);
-    if (!data.k) return;
-
-    const k = data.k; // candle data
-
-    const candle = {
-      open: k.o,
-      close: k.c,
-      time: k.t,
+    const k = msg.k;
+    const newCandle = {
+      open: parseFloat(k.o),
+      high: parseFloat(k.h),
+      low: parseFloat(k.l),
+      close: parseFloat(k.c),
+      time: k.t
     };
 
     if (k.x === false) {
-      // Candle running (update last)
-      candles[candles.length - 1] = candle;
+      // Candle is still open (update the last candle)
+      if (candles.length > 0) candles[candles.length - 1] = newCandle;
     } else {
-      // Candle closed → push new
-      candles.push(candle);
-      if (candles.length > HIST_LIMIT) candles.shift();
-
-      // NEW SIGNAL — every 1 minute
-      getSignal();
+      // Candle closed (push new candle)
+      candles.push(newCandle);
+      if (candles.length > HIST_LIMIT) candles.shift(); // Remove oldest
+      
+      // TRIGGER ANALYSIS ONLY ON CANDLE CLOSE
+      analyzeMarket();
     }
-
-    sendToFrontend({ type: "price", data: candle });
   };
+
+  ws.onclose = () => {
+    console.log("Binance disconnected. Reconnecting in 3s...");
+    setTimeout(connectBinanceWebSocket, 3000);
+  };
+
+  ws.onerror = (err) => console.error("WebSocket Error:", err.message);
 }
 
-// ---------------- ROUTES ---------------
-app.get("/", (req, res) => {
-  res.send("Backend running 🚀");
+// ===================================================
+// START SERVER
+// ===================================================
+
+app.get("/", (req, res) => res.send("Trading Bot Backend is Running 🚀"));
+
+server.listen(PORT, async () => {
+  console.log(`Server started on http://localhost:${PORT}`);
+  await loadHistoricalData();
+  connectBinanceWebSocket();
 });
-
-// ------------- START SERVER ------------
-server.listen(4000, async () => {
-  console.log("Server running on port 4000");
-  await loadInitialCandles();
-  connectBinance();
-});
-
-// ================= SIGNAL ENGINE WITH PATTERN + SL/TP + PRICE RANGE =================
-
-function detectChartPatterns(candles) {
-  if (!candles || candles.length < 20) return null;
-
-  const last = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
-
-  // ----- Bullish Engulfing -----
-  if (prev.close < prev.open && last.close > last.open && last.close > prev.open)
-    return { pattern: "Bullish Engulfing", type: "bullish" };
-
-  // ----- Bearish Engulfing -----
-  if (prev.close > prev.open && last.close < last.open && last.close < prev.open)
-    return { pattern: "Bearish Engulfing", type: "bearish" };
-
-  // ----- Double Bottom -----
-  const lows = candles.slice(-6).map(c => c.low);
-  const min1 = lows[0];
-  const min2 = lows[3];
-  if (Math.abs(min1 - min2) < min1 * 0.003)
-    return { pattern: "Double Bottom", type: "bullish" };
-
-  // ----- Double Top -----
-  const highs = candles.slice(-6).map(c => c.high);
-  const max1 = highs[0];
-  const max2 = highs[3];
-  if (Math.abs(max1 - max2) < max1 * 0.003)
-    return { pattern: "Double Top", type: "bearish" };
-
-  return null;
-}
-
-
-// ================= PRICE RANGE + SL/TP CALCULATOR =================
-
-function calculateLevels(price, direction) {
-  const range = {
-    buy: {
-      priceRange: [price * 0.995, price * 1.005],
-      stopLoss: price * 0.985,
-      takeProfit: price * 1.02
-    },
-    sell: {
-      priceRange: [price * 1.005, price * 0.995],
-      stopLoss: price * 1.015,
-      takeProfit: price * 0.98
-    }
-  };
-
-  return range[direction];
-}
-
-// ================= SIGNAL ENGINE WITH PATTERN + SL/TP + PRICE RANGE =================
-
-function detectChartPatterns(candles) {
-  if (!candles || candles.length < 20) return null;
-
-  const last = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
-
-  // ----- Bullish Engulfing -----
-  if (prev.close < prev.open && last.close > last.open && last.close > prev.open)
-    return { pattern: "Bullish Engulfing", type: "bullish" };
-
-  // ----- Bearish Engulfing -----
-  if (prev.close > prev.open && last.close < last.open && last.close < prev.open)
-    return { pattern: "Bearish Engulfing", type: "bearish" };
-
-  // ----- Double Bottom -----
-  const lows = candles.slice(-6).map(c => c.low);
-  const min1 = lows[0];
-  const min2 = lows[3];
-  if (Math.abs(min1 - min2) < min1 * 0.003)
-    return { pattern: "Double Bottom", type: "bullish" };
-
-  // ----- Double Top -----
-  const highs = candles.slice(-6).map(c => c.high);
-  const max1 = highs[0];
-  const max2 = highs[3];
-  if (Math.abs(max1 - max2) < max1 * 0.003)
-    return { pattern: "Double Top", type: "bearish" };
-
-  return null;
-}
-
-
-// ================= PRICE RANGE + SL/TP CALCULATOR =================
-
-function calculateLevels(price, direction) {
-  const range = {
-    buy: {
-      priceRange: [price * 0.995, price * 1.005],
-      stopLoss: price * 0.985,
-      takeProfit: price * 1.02
-    },
-    sell: {
-      priceRange: [price * 1.005, price * 0.995],
-      stopLoss: price * 1.015,
-      takeProfit: price * 0.98
-    }
-  };
-
-  return range[direction];
-}
-
-
-// ================= MAIN SIGNAL GENERATOR =================
-
-function generateSignal(candles) {
-  if (!candles || candles.length < 20) return null;
-
-  const pattern = detectChartPatterns(candles);
-  if (!pattern) return null;
-
-  const lastPrice = candles[candles.length - 1].close;
-  const direction = pattern.type === "bullish" ? "buy" : "sell";
-
-  const levels = calculateLevels(lastPrice, direction);
-
-  return {
-    pattern: pattern.pattern,
-    direction,
-    currentPrice: lastPrice,
-    priceRange: levels.priceRange,
-    stopLoss: levels.stopLoss,
-    takeProfit: levels.takeProfit,
-    time: Date.now()
-  };
-}
-
-module.exports = { generateSignal };
